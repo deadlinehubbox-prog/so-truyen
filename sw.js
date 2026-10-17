@@ -1,7 +1,7 @@
 /* Sổ Truyện runs from this saved copy of its own files. Once installed it never fetches app code
    from the network again, so it keeps working offline and even after the website is taken down.
    Stories never pass through here. */
-const CACHE = "sotruyen-v4";
+const CACHE = "sotruyen-v5";
 const FILES = ["./", "index.html", "app.js", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", e => {

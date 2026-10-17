@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; manifest-src 'self'; worker-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; manifest-src 'self'; worker-src 'self'; connect-src 'self' https://api.github.com; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <title>Sổ Truyện</title>
@@ -187,6 +187,10 @@ body.kb .tb{padding-bottom:4px}
 .tb .glyph{font-size:18px;line-height:1}
 .tb .glyph.sm{font-size:15px}
 .tb .sep{flex:0 0 1px;align-self:stretch;margin:8px 4px;background:var(--line)}
+.iconbtn.spin svg{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){.iconbtn.spin svg{animation-duration:3s}}
+.iconbtn.bad{color:var(--danger)}
 .status #wc{font-variant-numeric:tabular-nums}
 
 /* reading */

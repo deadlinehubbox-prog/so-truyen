@@ -43,6 +43,7 @@ const ICON = {
   search: SVG('<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>'),
   up: SVG('<path d="M12 19V5M6 11l6-6 6 6"/>', 'width="18" height="18"'),
   down: SVG('<path d="M12 5v14M6 13l6 6 6-6"/>', 'width="18" height="18"'),
+  sync: SVG('<path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 3v5h5"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 21v-5h-5"/>'),
   trash: SVG('<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>', 'width="18" height="18"')
 };
 function setBar(html){ $("#bar").innerHTML = html; }
@@ -104,8 +105,18 @@ const DB = {
   get(store, key){ return req(idb.transaction(store).objectStore(store).get(key)); },
   all(store){ return req(idb.transaction(store).objectStore(store).getAll()); },
   keys(store){ return req(idb.transaction(store).objectStore(store).getAllKeys()); },
-  write(ops){
+  write(ops, opts = {}){
     if(!ops.length) return Promise.resolve();
+    if(syncCfg && !opts.remote){   // remember what changed here so it can be sent to the other device
+      let n = 0;
+      for(const o of ops){
+        let k = null;
+        if(KEY_DIR[o.store] && (o.op === "put" || o.op === "del")) k = o.store + ":" + (o.op === "put" ? o.value.id : o.key);
+        else if(o.store === "meta" && o.key === "vault" && o.op === "put") k = "vault";
+        if(k){ dirty.set(k, (dirty.get(k) || 0) + 1); n++; }
+      }
+      if(n) ops = ops.concat(dirtyOps());
+    }
     const stores = [...new Set(ops.map(o => o.store))];
     return new Promise((res, rej) => {
       const t = idb.transaction(stores, "readwrite");
@@ -236,6 +247,7 @@ async function imageDataURL(id){
 }
 // Remove image records no chapter refers to any more.
 async function cleanupImages(){
+  if(sync.running) return;
   try{
     const used = new Set(); for(const c of chapters.values()) imageIds(c.body).forEach(i => used.add(i));
     const keys = await DB.keys("images");
@@ -294,7 +306,7 @@ function renderLock(mode){
         <label class="check"><input type="checkbox" id="ack"> Mình đã hiểu và đã ghi lại mật khẩu</label></div>` : ""}
       <p class="err" id="err" hidden></p>
       <button class="primary" id="go" type="submit">${create ? "Tạo khoá và bắt đầu" : "Mở sổ"}</button>
-      ${create ? "" : `<button class="linkbtn" type="button" id="forgot">Quên mật khẩu?</button>`}
+      ${create ? `<button class="linkbtn" type="button" id="connect">Đã dùng Sổ Truyện trên máy khác? Kết nối để lấy truyện về</button>` : `<button class="linkbtn" type="button" id="forgot">Quên mật khẩu?</button>`}
     </form>
     ${hint}
     <div id="forgotBox"></div>
@@ -334,6 +346,7 @@ function renderLock(mode){
     await afterUnlock();
   });
   if($("#forgot")) $("#forgot").onclick = renderForgot;
+  if($("#connect")) $("#connect").onclick = renderConnect;
   setTimeout(() => pw.focus(), 60);
 }
 
@@ -351,29 +364,40 @@ function renderForgot(){
   };
 }
 
+async function reloadState(){
+  const st = new Map(), ch = new Map();
+  const [rs, rc] = await Promise.all([DB.all("stories"), DB.all("chapters")]);
+  for(const r of rs){
+    if(r.deleted) continue;
+    let m = {title:"(không mở được)"}; try{ m = await unseal(r.enc); }catch(e){}
+    st.set(r.id, {id:r.id, title:m.title, notes:m.notes || "", createdAt:r.createdAt, updatedAt:r.updatedAt});
+  }
+  for(const r of rc){
+    if(r.deleted || !st.has(r.sid)) continue;
+    let m = {title:"(không mở được)", body:""}; try{ m = await unseal(r.enc); }catch(e){}
+    const body = m.fmt === "html" ? m.body : textToHTML(m.body);
+    ch.set(r.id, {id:r.id, sid:r.sid, title:m.title, body, order:r.order, createdAt:r.createdAt, updatedAt:r.updatedAt});
+  }
+  stories.clear(); chapters.clear();
+  st.forEach((v, k) => stories.set(k, v)); ch.forEach((v, k) => chapters.set(k, v));
+}
 async function afterUnlock(){
   resetMain().innerHTML = `<div class="loading">Đang mở sổ…</div>`;
   stories.clear(); chapters.clear();
-  try{
-    const [rs, rc] = await Promise.all([DB.all("stories"), DB.all("chapters")]);
-    for(const r of rs){
-      let m = {title:"(không mở được)"}; try{ m = await unseal(r.enc); }catch(e){}
-      stories.set(r.id, {id:r.id, title:m.title, notes:m.notes || "", createdAt:r.createdAt, updatedAt:r.updatedAt});
-    }
-    for(const r of rc){
-      let m = {title:"(không mở được)", body:""}; try{ m = await unseal(r.enc); }catch(e){}
-      const body = m.fmt === "html" ? m.body : textToHTML(m.body);
-      chapters.set(r.id, {id:r.id, sid:r.sid, title:m.title, body, order:r.order, createdAt:r.createdAt, updatedAt:r.updatedAt});
-    }
-  }catch(e){ return fatal("Không đọc được dữ liệu trên máy. Hãy tải lại ứng dụng."); }
+  await loadSync();
+  if(syncCfg && !(await DB.keys("stories")).length){
+    resetMain().innerHTML = `<div class="loading">Đang tải truyện về từ máy kia…</div>`;
+    await syncNow();
+  }
+  try{ await reloadState(); }catch(e){ return fatal("Không đọc được dữ liệu trên máy. Hãy tải lại ứng dụng."); }
   try{ if(navigator.storage && navigator.storage.persist) navigator.storage.persist(); }catch(e){}
   cleanupImages();
   renderLibrary();
+  if(syncCfg) syncNow();
 }
-
 async function lock(){
   try{ await flush(); }catch(e){}
-  ed = null; KEY = null;
+  ed = null; KEY = null; syncCfg = null; sync.err = ""; sync.pwRemote = null;
   stories.clear(); chapters.clear();
   imgURL.forEach(u => URL.revokeObjectURL(u)); imgURL.clear();
   renderLock("unlock");
@@ -383,10 +407,12 @@ async function lock(){
 function renderLibrary(){
   view = {name:"library"};
   setBar(`<div class="brand grow">Sổ <i>Truyện</i></div>
-    <button class="iconbtn" id="setBtn" aria-label="Cài đặt và sao lưu">${ICON.gear}</button>
+    ${syncCfg ? `<button class="iconbtn" id="syncBtn" aria-label="Đồng bộ ngay">${ICON.sync}</button>` : ""}
+    <button class="iconbtn" id="setBtn" aria-label="Cài đặt, sao lưu và đồng bộ">${ICON.gear}</button>
     <button class="iconbtn" id="lockBtn" aria-label="Khoá sổ">${ICON.lock}</button>`);
   $("#lockBtn").onclick = lock;
   $("#setBtn").onclick = renderSettings;
+  if($("#syncBtn")) $("#syncBtn").onclick = () => syncNow(true);
   const list = sortedStories();
   const total = list.reduce((a,s) => a + storyWords(s.id), 0);
   const last = [...chapters.values()].sort((a,b) => (b.updatedAt||0)-(a.updatedAt||0))[0];
@@ -410,12 +436,25 @@ function renderLibrary(){
           <span class="m">${n} chương · ${fmtN(storyWords(s.id))} chữ · sửa ${ago(s.updatedAt)}</span></span>
           <span class="chev">${ICON.chev}</span></button>`;
       }).join("") + `</div>`;
-    const stale = !lastBackup || now() - lastBackup > 7*86400000;
+    const stale = !syncCfg && (!lastBackup || now() - lastBackup > 7*86400000);
     if(stale) html += `<div class="box"><p>${lastBackup ? `Lần sao lưu gần nhất: ${ago(lastBackup)}.` : "Bạn chưa sao lưu lần nào."} Truyện chỉ nằm trên máy này, nên hãy lưu một bản sao (vẫn được mã hoá) vào Tệp hoặc iCloud.</p>
       <div class="row"><button class="ghost" id="quickBackup">Sao lưu ngay</button></div></div>`;
   }
-  html += `<p class="note">Sổ tự khoá khi bạn rời ứng dụng hoặc tắt màn hình quá 10 phút. Bấm ổ khoá để khoá ngay.</p></div>`;
+  if(sync.err === "pw") html += `<form class="box danger form" id="pwBox" novalidate>
+      <p><strong>Mật khẩu của sổ đã được đổi ở máy khác.</strong> Nhập mật khẩu mới để tiếp tục đồng bộ. Truyện trên máy này vẫn còn nguyên.</p>
+      <div class="field"><label for="npw">Mật khẩu mới</label><input id="npw" type="password" autocomplete="current-password" autocapitalize="off"></div>
+      <p class="err" id="npwErr" hidden></p>
+      <div class="row"><button class="primary" id="npwGo" type="submit">Tiếp tục đồng bộ</button></div></form>`;
+  html += `${syncCfg ? `<p class="note syncLine">${esc(syncLabel())}</p>` : ""}<p class="note">Sổ tự khoá khi bạn rời ứng dụng hoặc tắt màn hình quá 10 phút. Bấm ổ khoá để khoá ngay.</p></div>`;
   resetMain().innerHTML = html;
+  renderSyncBadge();
+  if($("#pwBox")) $("#pwBox").addEventListener("submit", async e => {
+    e.preventDefault();
+    const go = $("#npwGo"), err = $("#npwErr"); go.disabled = true; go.textContent = "Đang kiểm tra…";
+    let ok = false; try{ ok = await adoptRemotePassword($("#npw").value); }catch(ex){}
+    if(!ok){ err.textContent = "Mật khẩu chưa đúng."; err.hidden = false; go.disabled = false; go.textContent = "Tiếp tục đồng bộ"; return; }
+    toast("Đã cập nhật mật khẩu mới."); renderLibrary();
+  });
   $("#newStory").onclick = newStory;
   if($("#resume")) $("#resume").onclick = () => openEditor(last.id);
   if($("#quickBackup")) $("#quickBackup").onclick = backup;
@@ -531,7 +570,7 @@ function renderStory(sid, opt = {}){
   $$("[data-delch]").forEach(b => b.onclick = () => renderStory(sid, {arrange:true, confirmCh:b.dataset.delch, keepScroll:true}));
   if(delC){
     $("#yesDelCh").onclick = async () => {
-      try{ await DB.write([{store:"chapters", op:"del", key:delC.id}]); }catch(e){ return toast("Chưa xoá được."); }
+      try{ await DB.write([{store:"chapters", op:"put", value:{id:delC.id, sid:delC.sid, deleted:true, updatedAt:now()}}]); }catch(e){ return toast("Chưa xoá được."); }
       chapters.delete(delC.id); cleanupImages(); toast("Đã xoá chương.");
       renderStory(sid, {arrange:true, keepScroll:true});
     };
@@ -543,7 +582,8 @@ function renderStory(sid, opt = {}){
   $("#del").onclick = () => renderStory(sid, {confirmDel:true, keepScroll:true});
   if(opt.confirmDel){
     $("#yesDel").onclick = async () => {
-      const ops = [{store:"stories", op:"del", key:sid}, ...list.map(c => ({store:"chapters", op:"del", key:c.id}))];
+      const t = now();
+      const ops = [{store:"stories", op:"put", value:{id:sid, deleted:true, updatedAt:t}}, ...list.map(c => ({store:"chapters", op:"put", value:{id:c.id, sid, deleted:true, updatedAt:t}}))];
       try{ await DB.write(ops); }catch(e){ return toast("Chưa xoá được. Thử lại sau."); }
       stories.delete(sid); list.forEach(c => chapters.delete(c.id)); cleanupImages();
       toast("Đã xoá truyện."); renderLibrary();
@@ -673,7 +713,7 @@ function openEditor(cid, focusTitle){
   const c = chapters.get(cid); if(!c) return;
   const s = stories.get(c.sid);
   view = {name:"editor", sid:c.sid, cid};
-  ed = {id:cid, dirty:false, t:null};
+  ed = {id:cid, dirty:false, t:null, loadedAt:c.updatedAt};
   savedRange = null;
   setBar(`<button class="iconbtn" id="back" aria-label="Về danh sách chương">${ICON.back}</button>
     <div class="grow"></div><span class="status" id="status" data-s="saved"><span class="dot"></span><span id="statusTxt">Đã lưu</span><span id="wc"></span></span>`);
@@ -724,7 +764,7 @@ function openEditor(cid, focusTitle){
   tb.addEventListener("mousedown", e => { if(e.target.closest("button")) e.preventDefault(); });
   tb.addEventListener("click", e => { const b = e.target.closest("button[data-cmd]"); if(b) runCmd(b.dataset.cmd); });
   $("#imgIn").addEventListener("change", e => { const files = Array.from(e.target.files || []); e.target.value = ""; externalUntil = 0; if(files.length) insertImages(files); });
-  $("#back").onclick = async () => { await flush(); ed = null; cleanupImages(); renderStory(c.sid, {keepScroll:false}); };
+  $("#back").onclick = async () => { await flush(); ed = null; cleanupImages(); renderStory(c.sid, {keepScroll:false}); if(syncCfg) syncNow(); };
 
   if(focusTitle){ title.focus(); title.select(); }
   else { const last = body.lastElementChild; if(last && last.tagName !== "FIGURE") placeCaret(last, false); const sc = $("#edScroll"); sc.scrollTop = sc.scrollHeight; }
@@ -964,7 +1004,7 @@ async function flush(){
   setStatus("saving", "Đang lưu…");
   try{
     await saveChapter(next);
-    chapters.set(c.id, next); touchStory(c.sid, t);
+    chapters.set(c.id, next); touchStory(c.sid, t); e.loadedAt = t;
     if(ed === e && !e.dirty){ setStatus("saved", "Đã lưu"); updateWC(); }
   }catch(err){
     e.dirty = true;
@@ -980,7 +1020,7 @@ function renderSettings(){
     <button class="iconbtn" id="lockBtn" aria-label="Khoá sổ">${ICON.lock}</button>`);
   const lastBackup = ls.get("sotruyen.lastBackup", 0);
   resetMain().innerHTML = `<div class="col">
-    <h1>Cài đặt & sao lưu</h1>
+    <h1>Cài đặt</h1>
     <section class="box">
       <h2>Sao lưu</h2>
       <p class="sub">Tạo một file chứa toàn bộ truyện và ảnh, <strong>vẫn được mã hoá</strong> bằng mật khẩu hiện tại. Lưu file vào Tệp, iCloud hoặc ổ cứng riêng. Không ai đọc được file nếu không có mật khẩu.</p>
@@ -993,6 +1033,7 @@ function renderSettings(){
       <div class="row"><button class="ghost" id="rfBtn" type="button">Chọn file sao lưu</button><input id="rf" type="file" accept=".json,application/json" hidden></div>
       <div id="restoreBox"></div>
     </section>
+    ${syncSettingsHTML()}
     <section class="box">
       <h2>Đổi mật khẩu</h2>
       <form id="cp" class="form" novalidate>
@@ -1011,7 +1052,7 @@ function renderSettings(){
     </section>
     <section class="box">
       <h2>Về sự riêng tư</h2>
-      <p class="sub">Chữ và ảnh được mã hoá AES-256 bằng khoá sinh từ mật khẩu của bạn, chỉ lưu trên máy này. Ảnh được vẽ lại khi chèn nên thông tin ẩn như vị trí chụp bị xoá. Ứng dụng không có máy chủ, không gửi dữ liệu đi đâu và chạy được khi không có mạng. Sổ tự khoá khi bạn rời ứng dụng quá 10 phút, và nội dung luôn được che khi bạn xem màn hình đa nhiệm. Mã ứng dụng được giữ cố định trên máy sau khi cài, không tự cập nhật từ mạng.</p>
+      <p class="sub">Chữ và ảnh được mã hoá AES-256 bằng khoá sinh từ mật khẩu của bạn. Khi bật đồng bộ, chỉ bản đã mã hoá được gửi vào kho riêng tư của bạn; mật khẩu không bao giờ rời máy. Ảnh được vẽ lại khi chèn nên thông tin ẩn như vị trí chụp bị xoá. Ứng dụng không có máy chủ riêng và vẫn viết được khi không có mạng. Sổ tự khoá khi bạn rời ứng dụng quá 10 phút, và nội dung luôn được che khi bạn xem màn hình đa nhiệm. Mã ứng dụng được giữ cố định trên máy sau khi cài, không tự cập nhật từ mạng.</p>
     </section>
   </div>`;
   $("#back").onclick = renderLibrary;
@@ -1020,6 +1061,7 @@ function renderSettings(){
   $("#rfBtn").onclick = () => { externalUntil = now() + 120000; $("#rf").click(); };
   $("#rf").onchange = e => { const f = e.target.files[0]; e.target.value = ""; externalUntil = 0; if(f) startRestore(f); };
   $("#cp").addEventListener("submit", changePassword);
+  bindSyncSettings();
   checkOffline();
 }
 
@@ -1033,7 +1075,7 @@ async function checkOffline(){
   }catch(e){ if(st) st.textContent = ""; }
   if(!el) return;
   let ready = false;
-  try{ ready = !!(navigator.serviceWorker && navigator.serviceWorker.controller) && (await (await caches.open("sotruyen-v4")).keys()).length >= 7; }catch(e){}
+  try{ ready = !!(navigator.serviceWorker && navigator.serviceWorker.controller) && (await (await caches.open("sotruyen-v5")).keys()).length >= 7; }catch(e){}
   el.innerHTML = ready
     ? "<strong>Đã sẵn sàng chạy không cần mạng.</strong> Ứng dụng đã được lưu đầy đủ trên máy, mở được kể cả khi trang web bị gỡ xuống."
     : "Chưa sẵn sàng chạy không cần mạng. Hãy mở ứng dụng từ màn hình chính khi có mạng, đóng hẳn rồi mở lại một lần.";
@@ -1042,7 +1084,8 @@ async function checkOffline(){
 async function backup(){
   try{
     toast("Đang tạo file sao lưu…");
-    const [rs, rc, ri] = await Promise.all([DB.all("stories"), DB.all("chapters"), DB.all("images")]);
+    let [rs, rc, ri] = await Promise.all([DB.all("stories"), DB.all("chapters"), DB.all("images")]);
+    rs = rs.filter(r => !r.deleted); rc = rc.filter(r => !r.deleted);
     const images = ri.map(r => ({id:r.id, sid:r.sid, cid:r.cid, type:r.type, createdAt:r.createdAt, data:b64(r.enc)}));
     const data = {app:"so-truyen", v:2, exportedAt:now(), vault:{salt:vault.salt, iter:vault.iter, check:vault.check}, stories:rs, chapters:rc, images};
     const d = new Date(), pad = n => String(n).padStart(2, "0");
@@ -1081,6 +1124,7 @@ async function restoreWith(data, key){
   try{
     const ops = [];
     for(const r of data.stories){
+      if(r.deleted) continue;
       const cur = stories.get(r.id);
       if(cur && (cur.updatedAt||0) >= (r.updatedAt||0)) continue;
       const m = await unseal(r.enc, key);
@@ -1088,6 +1132,7 @@ async function restoreWith(data, key){
       ops.push({store:"stories", op:"put", value: await sealStory(s)}); stories.set(s.id, s);
     }
     for(const r of (data.chapters || [])){
+      if(r.deleted) continue;
       const cur = chapters.get(r.id);
       if(cur && (cur.updatedAt||0) >= (r.updatedAt||0)) continue;
       const m = await unseal(r.enc, key);
@@ -1121,17 +1166,408 @@ async function changePassword(e){
   go.textContent = "Đang mã hoá lại…";
   try{
     const {key, vault:v} = await makeVault(np);
-    const ops = [{store:"meta", op:"put", value:v, key:"vault"}];
-    for(const s of stories.values()) ops.push({store:"stories", op:"put", value: await sealStory(s, key)});
-    for(const c of chapters.values()) ops.push({store:"chapters", op:"put", value: await sealChapter(c, key)});
-    for(const im of await DB.all("images")) ops.push({store:"images", op:"put", value:{...im, enc: await sealBytes(await unsealBytes(im.enc), key)}});
+    const ops = [{store:"meta", op:"put", value:v, key:"vault"}].concat(await reencryptOps(key));
     await DB.write(ops);   // all-or-nothing
     vault = v; KEY = key;
     $("#op").value = $("#np").value = $("#np2").value = "";
     go.disabled = false; go.textContent = "Đổi mật khẩu";
-    toast("Đã đổi mật khẩu. Hãy tạo bản sao lưu mới.");
+    toast(syncCfg ? "Đã đổi mật khẩu. Máy kia sẽ hỏi mật khẩu mới ở lần đồng bộ tới." : "Đã đổi mật khẩu. Hãy tạo bản sao lưu mới.");
+    if(syncCfg) syncNow();
   }catch(ex){ fail("Chưa đổi được mật khẩu. Mật khẩu cũ vẫn dùng được."); }
 }
+
+/* ---------- sync between your own devices through a private GitHub repository ----------
+   Only sealed records leave this device: the repository holds the same encrypted text that is
+   stored here, under random file names. The access token is kept sealed with your password. */
+let syncCfg = null;                          // {owner, repo, branch, token}, only while unlocked
+let dirty = new Map();                       // record keys changed here and not yet sent
+let syncState = {lastCommit:null, treeSha:null, synced:{}};   // the repository after our last sync
+const sync = {running:false, again:false, at:ls.get("sotruyen.syncAt", 0), err:"", pwRemote:null, promise:null};
+const GH = "https://api.github.com";
+const textB64 = s => b64(TE.encode(s));
+const b64Text = s => TD.decode(unb64(String(s).replace(/\s+/g, "")));
+const KEY_DIR = {stories:"s", chapters:"c", images:"i"};
+const keyPath = k => k === "vault" ? "vault.json" : KEY_DIR[k.split(":")[0]] + "/" + k.split(":")[1] + ".json";
+function pathKey(p){
+  if(p === "vault.json") return "vault";
+  const m = p.match(/^([sci])\/([a-z0-9]+)\.json$/i); if(!m) return null;
+  return {s:"stories", c:"chapters", i:"images"}[m[1]] + ":" + m[2];
+}
+
+async function gh(cfg, path, opt = {}){
+  let res;
+  try{
+    res = await fetch(GH + "/repos/" + cfg.owner + "/" + cfg.repo + path, {
+      method: opt.method || "GET", cache: "no-store",
+      headers: Object.assign({"Authorization": "Bearer " + cfg.token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+        opt.body ? {"Content-Type": "application/json"} : {}),
+      body: opt.body ? JSON.stringify(opt.body) : undefined
+    });
+  }catch(e){ const x = new Error("offline"); x.status = 0; throw x; }
+  let data = null; try{ data = await res.json(); }catch(e){}
+  if(!res.ok){ const x = new Error((data && data.message) || ("HTTP " + res.status)); x.status = res.status; throw x; }
+  return data;
+}
+function syncMsg(e){
+  if(!e) return "";
+  if(e.status === 0) return "Chưa có mạng, sẽ đồng bộ khi có mạng lại.";
+  if(e.status === 401) return "Mã truy cập sai hoặc đã hết hạn. Tạo mã mới rồi vào Cài đặt → Đổi mã truy cập.";
+  if(e.status === 404) return "Không tìm thấy kho, hoặc mã truy cập chưa được cấp quyền cho kho này.";
+  if(e.status === 403) return "Mã truy cập chưa có quyền ghi (Contents: Read and write), hoặc GitHub đang tạm giới hạn. Thử lại sau.";
+  if(e.userMsg) return e.userMsg;
+  return "Chưa đồng bộ được (" + e.message + ").";
+}
+function parseRepo(s){
+  s = String(s || "").trim().replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  const m = s.match(/^([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/);
+  return m ? {owner:m[1], repo:m[2]} : null;
+}
+function userErr(msg){ const e = new Error(msg); e.userMsg = msg; return e; }
+async function checkRepo(cfg){
+  const info = await gh(cfg, "");
+  if(!info.private) throw userErr("Kho này đang để Công khai (Public). Hãy dùng kho Riêng tư (Private).");
+  cfg.branch = info.default_branch || "main";
+  return cfg;
+}
+async function remoteHead(cfg){
+  try{ return (await gh(cfg, "/git/ref/heads/" + cfg.branch)).object.sha; }
+  catch(e){ if(e.status === 409 || e.status === 404) return null; throw e; }   // empty repository
+}
+async function remoteTree(cfg, commitSha){
+  const c = await gh(cfg, "/git/commits/" + commitSha);
+  const t = await gh(cfg, "/git/trees/" + c.tree.sha + "?recursive=1");
+  const map = {};
+  for(const e of t.tree) if(e.type === "blob") map[e.path] = e.sha;
+  return {treeSha:c.tree.sha, map};
+}
+const readBlob = async (cfg, sha) => JSON.parse(b64Text((await gh(cfg, "/git/blobs/" + sha)).content));
+async function remoteVault(cfg){
+  const head = await remoteHead(cfg); if(!head) return null;
+  const {map} = await remoteTree(cfg, head);
+  return map["vault.json"] ? readBlob(cfg, map["vault.json"]) : null;
+}
+
+async function recordJSON(key){
+  if(key === "vault") return JSON.stringify({app:"so-truyen", salt:vault.salt, iter:vault.iter, check:vault.check, createdAt:vault.createdAt || 0});
+  const [store, id] = key.split(":");
+  const r = await DB.get(store, id);
+  if(!r) return null;
+  if(store === "images") return JSON.stringify({id:r.id, sid:r.sid, cid:r.cid, type:r.type, createdAt:r.createdAt, data:b64(r.enc)});
+  return JSON.stringify(r);
+}
+const dirtyOps = () => [{store:"meta", op:"put", key:"dirty", value:[...dirty.keys()]}];
+const stateOps = () => [{store:"meta", op:"put", key:"syncState", value:syncState}];
+async function saveSyncCfg(cfg, key = KEY){ return {store:"meta", op:"put", key:"sync", value:{enc: await seal(cfg, key)}}; }
+
+// When the same chapter was changed on both devices, keep the newer one and save the other as a copy.
+async function conflictCopy(local, remote, keepRemote){
+  let a, b;
+  try{ a = await unseal(local.enc); b = await unseal(remote.enc); }catch(e){ return null; }
+  if(a.title === b.title && a.body === b.body) return null;
+  const loser = keepRemote ? a : b, src = keepRemote ? local : remote, t = now();
+  const d = new Date(src.updatedAt || t), pad = n => String(n).padStart(2, "0");
+  return sealChapter({id:uid(), sid:src.sid, title:(loser.title || "Chương") + ` (bản xung đột ${pad(d.getHours())}:${pad(d.getMinutes())} ${pad(d.getDate())}/${pad(d.getMonth()+1)})`,
+    body: loser.fmt === "html" ? loser.body : textToHTML(loser.body), order:(src.order || 0) + 0.5, createdAt:t, updatedAt:t});
+}
+
+async function pull(cfg){
+  const head = await remoteHead(cfg);
+  if(!head) return {head:null, treeSha:null, map:{}, changed:false, copies:0};
+  if(head === syncState.lastCommit && syncState.treeSha) return {head, treeSha:syncState.treeSha, map:{...syncState.synced}, changed:false, copies:0};
+  const {treeSha, map} = await remoteTree(cfg, head);
+  if(map["vault.json"] && map["vault.json"] !== syncState.synced["vault.json"]){
+    const rv = await readBlob(cfg, map["vault.json"]);
+    if(rv.salt !== vault.salt){ const e = new Error("vault"); e.code = "vault"; e.remoteVault = rv; throw e; }
+  }
+  const remoteOps = [], localOps = [];
+  for(const [path, sha] of Object.entries(map)){
+    const key = pathKey(path);
+    if(!key || key === "vault" || syncState.synced[path] === sha) continue;
+    const [store, id] = key.split(":");
+    const local = await DB.get(store, id);
+    if(store === "images"){
+      if(!local){ const r = await readBlob(cfg, sha); remoteOps.push({store, op:"put", value:{id:r.id, sid:r.sid, cid:r.cid, type:r.type, createdAt:r.createdAt, enc:unb64(r.data)}}); }
+      continue;
+    }
+    const remote = await readBlob(cfg, sha);
+    if(!local){ remoteOps.push({store, op:"put", value:remote}); continue; }
+    const ru = remote.updatedAt || 0, lu = local.updatedAt || 0;
+    if(ru === lu) continue;
+    const localChanged = dirty.has(key), remoteNewer = ru > lu;
+    if(store === "chapters" && localChanged && !remote.deleted && !local.deleted){
+      const copy = await conflictCopy(local, remote, remoteNewer);
+      if(copy) localOps.push({store:"chapters", op:"put", value:copy});
+    }
+    if(remoteNewer){ remoteOps.push({store, op:"put", value:remote}); dirty.delete(key); }
+    else if(!localChanged) dirty.set(key, 1);
+  }
+  // pictures the other device removed
+  const used = new Set(); for(const c of chapters.values()) imageIds(c.body).forEach(i => used.add(i));
+  for(const path of Object.keys(syncState.synced)){
+    if(map[path]) continue;
+    const key = pathKey(path);
+    if(!key || !key.startsWith("images:") || dirty.has(key)) continue;
+    const id = key.slice(7);
+    if(used.has(id)) dirty.set(key, 1); else remoteOps.push({store:"images", op:"del", key:id});
+  }
+  syncState = {lastCommit:head, treeSha, synced:{...map}};
+  await DB.write(remoteOps.concat(dirtyOps(), stateOps()), {remote:true});
+  if(localOps.length) await DB.write(localOps);
+  return {head, treeSha, map:{...map}, changed: remoteOps.length + localOps.length > 0, copies: localOps.length};
+}
+
+async function push(cfg, base){
+  const snapshot = new Map(dirty);
+  if(!snapshot.size) return base;
+  let {head, treeSha} = base; const map = {...base.map};
+  if(!head){   // empty repository: the first file makes the first commit
+    const r = await gh(cfg, "/contents/vault.json", {method:"PUT", body:{message:"Sổ Truyện", content:textB64(await recordJSON("vault")), branch:cfg.branch}});
+    head = r.commit.sha; treeSha = r.commit.tree.sha; map["vault.json"] = r.content.sha;
+  }
+  const entries = [], changes = {};
+  for(const key of snapshot.keys()){
+    const path = keyPath(key), json = await recordJSON(key);
+    if(json === null){ if(map[path]){ entries.push({path, mode:"100644", type:"blob", sha:null}); changes[path] = null; } continue; }
+    const b = await gh(cfg, "/git/blobs", {method:"POST", body:{content:json, encoding:"utf-8"}});
+    if(map[path] === b.sha) continue;
+    entries.push({path, mode:"100644", type:"blob", sha:b.sha}); changes[path] = b.sha;
+  }
+  if(entries.length){
+    const t = await gh(cfg, "/git/trees", {method:"POST", body:{base_tree:treeSha, tree:entries}});
+    const c = await gh(cfg, "/git/commits", {method:"POST", body:{message:"Sổ Truyện", tree:t.sha, parents:[head]}});
+    await gh(cfg, "/git/refs/heads/" + cfg.branch, {method:"PATCH", body:{sha:c.sha, force:false}});   // refused if the other device sent first
+    head = c.sha; treeSha = t.sha;
+    for(const [p, s] of Object.entries(changes)){ if(s) map[p] = s; else delete map[p]; }
+  }
+  for(const [k, v] of snapshot) if(dirty.get(k) === v) dirty.delete(k);
+  return {head, treeSha, map};
+}
+
+function syncLabel(){
+  if(!syncCfg) return "";
+  if(sync.running) return "Đang đồng bộ…";
+  if(sync.err === "pw") return "Mật khẩu đã được đổi ở máy khác.";
+  if(sync.err) return sync.err;
+  return sync.at ? "Đã đồng bộ " + ago(sync.at) + "." : "Chưa đồng bộ.";
+}
+function renderSyncBadge(){
+  const b = $("#syncBtn");
+  if(b){ b.classList.toggle("spin", sync.running); b.classList.toggle("bad", !!sync.err && !sync.running); }
+  $$(".syncLine").forEach(l => l.textContent = syncLabel());
+  if(sync.err === "pw" && view.name === "library" && !$("#pwBox")) renderLibrary();
+}
+
+function syncNow(manual){
+  if(!syncCfg || !KEY) return Promise.resolve();
+  if(sync.running){ sync.again = true; return sync.promise; }
+  if(sync.err === "pw") return Promise.resolve();
+  sync.running = true; renderSyncBadge();
+  sync.promise = (async () => {
+    let changed = false, copies = 0;
+    try{
+      await flush();
+      for(let attempt = 0; ; attempt++){
+        const base = await pull(syncCfg);
+        changed = changed || base.changed; copies += base.copies;
+        try{
+          const after = await push(syncCfg, base);
+          syncState = {lastCommit:after.head, treeSha:after.treeSha, synced:after.map};
+          await DB.write(dirtyOps().concat(stateOps()), {remote:true});
+          break;
+        }catch(e){ if((e.status === 422 || e.status === 409) && attempt < 3) continue; throw e; }
+      }
+      sync.err = ""; sync.at = now(); ls.set("sotruyen.syncAt", sync.at);
+      if(manual) toast("Đã đồng bộ.");
+    }catch(e){
+      if(e.code === "vault"){ sync.err = "pw"; sync.pwRemote = e.remoteVault; }
+      else sync.err = syncMsg(e);
+      if(manual && sync.err !== "pw") toast(sync.err);
+    }finally{
+      sync.running = false;
+      if(changed && KEY){ await reloadState(); refreshView(); cleanupImages(); }
+      if(copies) toast("Một chương được sửa ở cả hai máy. Bản cũ hơn được giữ lại thành chương “… (bản xung đột)”.");
+      renderSyncBadge();
+      if(sync.again){ sync.again = false; setTimeout(() => syncNow(), 300); }
+    }
+  })();
+  return sync.promise;
+}
+
+// Turn sync on for the book on this device.
+async function enableSync(cfg){
+  await checkRepo(cfg);
+  const rv = await remoteVault(cfg);
+  if(rv && rv.salt !== vault.salt) throw userErr("Kho này đang chứa một sổ khác. Hãy dùng một kho trống, hoặc kết nối từ màn hình đầu tiên trên máy mới.");
+  syncCfg = cfg;
+  dirty = new Map([["vault", 1]]);
+  for(const s of ["stories", "chapters", "images"]) for(const id of await DB.keys(s)) dirty.set(s + ":" + id, 1);
+  syncState = {lastCommit:null, treeSha:null, synced:{}};
+  sync.err = ""; sync.pwRemote = null;
+  await DB.write([await saveSyncCfg(cfg)].concat(dirtyOps(), stateOps()), {remote:true});
+  await syncNow();
+  if(sync.err) throw userErr(sync.err);
+}
+async function disableSync(){
+  syncCfg = null; dirty = new Map(); syncState = {lastCommit:null, treeSha:null, synced:{}}; sync.err = "";
+  await DB.write([{store:"meta", op:"del", key:"sync"}, {store:"meta", op:"del", key:"dirty"}, {store:"meta", op:"del", key:"syncState"}], {remote:true});
+}
+async function loadSync(){
+  syncCfg = null;
+  try{
+    const r = await DB.get("meta", "sync");
+    if(r) syncCfg = await unseal(r.enc);
+    dirty = new Map(((await DB.get("meta", "dirty")) || []).map(k => [k, 1]));
+    syncState = (await DB.get("meta", "syncState")) || {lastCommit:null, treeSha:null, synced:{}};
+  }catch(e){ syncCfg = null; }
+}
+
+// Re-encrypt everything on this device with another key (password changed here or on the other device).
+async function reencryptOps(key){
+  const ops = [];
+  for(const s of stories.values()) ops.push({store:"stories", op:"put", value: await sealStory(s, key)});
+  for(const c of chapters.values()) ops.push({store:"chapters", op:"put", value: await sealChapter(c, key)});
+  for(const im of await DB.all("images")) ops.push({store:"images", op:"put", value:{...im, enc: await sealBytes(await unsealBytes(im.enc), key)}});
+  if(syncCfg) ops.push(await saveSyncCfg(syncCfg, key));
+  return ops;
+}
+async function adoptRemotePassword(pw){
+  const rv = sync.pwRemote; if(!rv) return false;
+  const key = await openVault(pw, rv);
+  if(!key) return false;
+  const v = {v:1, salt:rv.salt, iter:rv.iter, check:rv.check, createdAt:rv.createdAt || now()};
+  const ops = await reencryptOps(key);
+  syncState = {lastCommit:null, treeSha:null, synced:{}};
+  await DB.write(ops.concat([{store:"meta", op:"put", key:"vault", value:v}], stateOps()), {remote:true});
+  vault = v; KEY = key; sync.err = ""; sync.pwRemote = null;
+  await syncNow(true);
+  return true;
+}
+
+function refreshView(){
+  const a = document.activeElement;
+  const typing = a && $("#main").contains(a) && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.isContentEditable);
+  if(view.name === "editor"){
+    if(!chapters.has(view.cid)){ ed = null; return renderStory(view.sid); }
+    if(ed && !ed.dirty && chapters.get(view.cid).updatedAt !== ed.loadedAt) openEditor(view.cid);
+    return;
+  }
+  if(typing) return;
+  if(view.name === "library") renderLibrary();
+  else if(view.name === "story") renderStory(view.sid, {keepScroll:true, arrange:view.arrange});
+  else if(view.name === "read") renderRead(view.sid);
+}
+
+/* second device: connect to a book that already exists on the other device */
+function renderConnect(){
+  view = {name:"connect"};
+  setBar(`<button class="iconbtn" id="back" aria-label="Quay lại">${ICON.back}</button><div class="brand grow">Sổ <i>Truyện</i></div>`);
+  resetMain().innerHTML = `<div class="col" style="padding-top:28px">
+    <div class="stack-6">
+      <span class="eyebrow">Dùng chung sổ với máy khác</span>
+      <h1>Kết nối để lấy truyện về</h1>
+      <p class="sub">Nhập đúng tên kho và mã truy cập bạn đã dùng khi bật đồng bộ ở máy kia. Sau đó nhập mật khẩu của sổ.</p>
+    </div>
+    <form id="cf" class="form" novalidate>
+      <div class="field"><label for="cRepo">Tên kho</label><input id="cRepo" placeholder="ten-github/so-truyen-data" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label for="cTok">Mã truy cập</label><input id="cTok" type="password" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field" id="cPwField" hidden><label for="cPw">Mật khẩu của sổ</label><input id="cPw" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <p class="err" id="cErr" hidden></p>
+      <button class="primary" id="cGo" type="submit">Tiếp tục</button>
+    </form>
+  </div>`;
+  $("#back").onclick = () => renderLock("create");
+  let rv = null, cfg = null;
+  const err = $("#cErr"), go = $("#cGo");
+  const fail = (m, label) => { err.textContent = m; err.hidden = false; go.disabled = false; go.textContent = label; };
+  $("#cf").addEventListener("submit", async e => {
+    e.preventDefault(); err.hidden = true;
+    if(!rv){
+      const repo = parseRepo($("#cRepo").value), token = $("#cTok").value.trim();
+      if(!repo) return fail("Tên kho cần có dạng ten-github/ten-kho.", "Tiếp tục");
+      if(!token) return fail("Hãy dán mã truy cập.", "Tiếp tục");
+      go.disabled = true; go.textContent = "Đang kiểm tra…";
+      try{
+        cfg = await checkRepo({...repo, token});
+        rv = await remoteVault(cfg);
+        if(!rv) return (rv = null, fail("Kho này chưa có sổ nào. Hãy bật đồng bộ ở máy đang có truyện trước.", "Tiếp tục"));
+      }catch(ex){ rv = null; return fail(syncMsg(ex), "Tiếp tục"); }
+      $("#cRepo").disabled = $("#cTok").disabled = true;
+      $("#cPwField").hidden = false; go.disabled = false; go.textContent = "Mở sổ và tải truyện về";
+      setTimeout(() => $("#cPw").focus(), 50);
+      return;
+    }
+    go.disabled = true; go.textContent = "Đang mở…";
+    let key = null; try{ key = await openVault($("#cPw").value, rv); }catch(ex){}
+    if(!key) return fail("Sai mật khẩu của sổ.", "Mở sổ và tải truyện về");
+    const v = {v:1, salt:rv.salt, iter:rv.iter, check:rv.check, createdAt:rv.createdAt || now()};
+    syncState = {lastCommit:null, treeSha:null, synced:{}}; dirty = new Map();
+    await DB.write([{store:"meta", op:"put", key:"vault", value:v}, await saveSyncCfg(cfg, key)].concat(dirtyOps(), stateOps()), {remote:true});
+    vault = v; KEY = key; $("#cPw").value = "";
+    await afterUnlock();
+  });
+  setTimeout(() => $("#cRepo").focus(), 60);
+}
+
+function syncSettingsHTML(){
+  if(syncCfg) return `<section class="box">
+      <h2>Đồng bộ giữa các máy</h2>
+      <p class="sub">Đang dùng chung sổ qua kho riêng tư <strong>${esc(syncCfg.owner + "/" + syncCfg.repo)}</strong>. Dữ liệu được mã hoá trước khi gửi, GitHub không đọc được.</p>
+      <p class="sub syncLine">${esc(syncLabel())}</p>
+      <div class="row"><button class="primary" id="syncGo">Đồng bộ ngay</button><button class="ghost" id="syncTokBtn">Đổi mã truy cập</button><button class="ghost danger" id="syncOff">Ngắt đồng bộ trên máy này</button></div>
+      <div id="syncTokBox"></div>
+    </section>`;
+  return `<section class="box">
+      <h2>Đồng bộ giữa các máy</h2>
+      <p class="sub">Dùng chung sổ trên iPhone và laptop. Truyện được mã hoá trên máy rồi mới gửi vào một kho GitHub <strong>riêng tư</strong> của bạn. GitHub chỉ giữ dữ liệu đã khoá, không đọc được. Máy kia mở bằng cùng mật khẩu.</p>
+      <form id="sf" class="form" novalidate>
+        <div class="field"><label for="sRepo">Tên kho riêng tư</label><input id="sRepo" placeholder="ten-github/so-truyen-data" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+        <div class="field"><label for="sTok">Mã truy cập</label><input id="sTok" type="password" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+        <p class="err" id="sErr" hidden></p>
+        <div class="row"><button class="primary" id="sGo" type="submit">Bật đồng bộ</button></div>
+      </form>
+    </section>`;
+}
+function bindSyncSettings(){
+  if(syncCfg){
+    $("#syncGo").onclick = () => syncNow(true);
+    $("#syncOff").onclick = async () => { await disableSync(); toast("Đã ngắt đồng bộ trên máy này. Truyện trên máy vẫn còn nguyên."); renderSettings(); };
+    $("#syncTokBtn").onclick = () => {
+      $("#syncTokBox").innerHTML = `<form id="tf" class="form" novalidate>
+        <div class="field"><label for="tTok">Mã truy cập mới</label><input id="tTok" type="password" placeholder="github_pat_…" autocomplete="off" autocapitalize="off"></div>
+        <p class="err" id="tErr" hidden></p><div class="row"><button class="ghost" id="tGo" type="submit">Lưu mã mới</button></div></form>`;
+      $("#tf").addEventListener("submit", async e => {
+        e.preventDefault();
+        const token = $("#tTok").value.trim(), go = $("#tGo"), err = $("#tErr");
+        if(!token) return;
+        go.disabled = true; go.textContent = "Đang kiểm tra…";
+        try{
+          const cfg = await checkRepo({owner:syncCfg.owner, repo:syncCfg.repo, token});
+          syncCfg = cfg; await DB.write([await saveSyncCfg(cfg)], {remote:true});
+          sync.err = ""; toast("Đã lưu mã truy cập mới."); renderSettings(); syncNow(true);
+        }catch(ex){ err.textContent = syncMsg(ex); err.hidden = false; go.disabled = false; go.textContent = "Lưu mã mới"; }
+      });
+      setTimeout(() => $("#tTok").focus(), 50);
+    };
+    return;
+  }
+  $("#sf").addEventListener("submit", async e => {
+    e.preventDefault();
+    const err = $("#sErr"), go = $("#sGo");
+    const fail = m => { err.textContent = m; err.hidden = false; go.disabled = false; go.textContent = "Bật đồng bộ"; };
+    err.hidden = true;
+    const repo = parseRepo($("#sRepo").value), token = $("#sTok").value.trim();
+    if(!repo) return fail("Tên kho cần có dạng ten-github/ten-kho.");
+    if(!token) return fail("Hãy dán mã truy cập.");
+    go.disabled = true; go.textContent = "Đang gửi truyện lên (đã mã hoá)…";
+    try{ await enableSync({...repo, token}); }
+    catch(ex){ syncCfg = null; await disableSync().catch(() => {}); return fail(syncMsg(ex)); }
+    toast("Đã bật đồng bộ."); renderSettings();
+  });
+}
+
+setInterval(() => {
+  if(KEY && syncCfg && document.visibilityState === "visible" && !sync.running && (dirty.size || now() - sync.at > 120000)) syncNow();
+}, 45000);
 
 /* ---------- privacy: hide content in app switcher, lock after 10 minutes away ---------- */
 const AWAY_LOCK_MS = 10 * 60 * 1000;
@@ -1140,10 +1576,11 @@ document.addEventListener("visibilitychange", () => {
   if(document.visibilityState === "hidden"){
     if(KEY && now() < externalUntil) return;
     hiddenAt = now();
-    if(KEY){ $("#shield").hidden = false; flush(); }
+    if(KEY){ $("#shield").hidden = false; if(syncCfg && !ed) syncNow(); else flush().then(() => { if(syncCfg) syncNow(); }); }
   } else {
     if(KEY && now() < externalUntil){ externalUntil = 0; }
     else if(KEY && hiddenAt && now() - hiddenAt >= AWAY_LOCK_MS) lock();
+    else if(KEY && syncCfg && now() - sync.at > 20000) syncNow();
     hiddenAt = 0;
     $("#shield").hidden = true;
   }
