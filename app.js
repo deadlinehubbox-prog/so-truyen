@@ -7,6 +7,7 @@
 /* ---------- helpers ---------- */
 const $ = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
+const nfc = s => String(s ?? "").normalize("NFC");
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const uid = () => Date.now().toString(36) + Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(36).padStart(2,"0")).join("");
 const countWords = t => { t = (t||"").trim(); return t ? t.split(/\s+/).length : 0; };
@@ -143,7 +144,7 @@ function cleanHTML(html){
   let cur = null;
   function inlineInto(nodes, parent){
     for(const n of nodes){
-      if(n.nodeType === 3){ parent.appendChild(document.createTextNode(n.nodeValue)); continue; }
+      if(n.nodeType === 3){ parent.appendChild(document.createTextNode(nfc(n.nodeValue))); continue; }
       if(n.nodeType !== 1 || DROP.has(n.tagName) || n.tagName === "FIGURE" || n.tagName === "HR") continue;
       if(n.classList && n.classList.contains("figbar")) continue;
       if(n.tagName === "BR"){ parent.appendChild(document.createElement("br")); continue; }
@@ -157,7 +158,7 @@ function cleanHTML(html){
     for(const n of nodes){
       if(n.nodeType === 3){
         if(!cur && !n.nodeValue.trim()) continue;
-        (cur || para(as)).appendChild(document.createTextNode(n.nodeValue));
+        (cur || para(as)).appendChild(document.createTextNode(nfc(n.nodeValue)));
         continue;
       }
       if(n.nodeType !== 1 || DROP.has(n.tagName)) continue;
@@ -171,7 +172,7 @@ function cleanHTML(html){
         const sz = n.getAttribute("data-size");
         f.setAttribute("data-size", ["s","m","l"].includes(sz) ? sz : "l");
         const cap = n.querySelector("figcaption"), fc = document.createElement("figcaption");
-        if(cap) fc.textContent = cap.textContent.replace(/\s+/g, " ").trim();
+        if(cap) fc.textContent = nfc(cap.textContent).replace(/\s+/g, " ").trim();
         f.appendChild(fc); out.appendChild(f);
         continue;
       }
@@ -223,6 +224,9 @@ const chapters = new Map();  // id -> {id,sid,title,body(html),order,createdAt,u
 const imgURL = new Map();    // image id -> blob: URL (decrypted, in memory only)
 let view = {name:"boot"};
 let fontSize = ls.get("sotruyen.fs", 18);
+const UI_SIZES = [["Nhỏ", 0.9], ["Vừa", 1], ["Lớn", 1.15], ["Rất lớn", 1.3]];
+let uiScale = ls.get("sotruyen.ui", 1);
+document.documentElement.style.setProperty("--ui", uiScale);
 
 const storyChapters = sid => [...chapters.values()].filter(c => c.sid === sid).sort((a,b) => (a.order||0)-(b.order||0) || (a.createdAt||0)-(b.createdAt||0));
 const storyWords = sid => storyChapters(sid).reduce((a,c) => a + chWords(c), 0);
@@ -370,13 +374,13 @@ async function reloadState(){
   for(const r of rs){
     if(r.deleted) continue;
     let m = {title:"(không mở được)"}; try{ m = await unseal(r.enc); }catch(e){}
-    st.set(r.id, {id:r.id, title:m.title, notes:m.notes || "", createdAt:r.createdAt, updatedAt:r.updatedAt});
+    st.set(r.id, {id:r.id, title:nfc(m.title), notes:nfc(m.notes || ""), createdAt:r.createdAt, updatedAt:r.updatedAt});
   }
   for(const r of rc){
     if(r.deleted || !st.has(r.sid)) continue;
     let m = {title:"(không mở được)", body:""}; try{ m = await unseal(r.enc); }catch(e){}
     const body = m.fmt === "html" ? m.body : textToHTML(m.body);
-    ch.set(r.id, {id:r.id, sid:r.sid, title:m.title, body, order:r.order, createdAt:r.createdAt, updatedAt:r.updatedAt});
+    ch.set(r.id, {id:r.id, sid:r.sid, title:nfc(m.title), body, order:r.order, createdAt:r.createdAt, updatedAt:r.updatedAt});
   }
   stories.clear(); chapters.clear();
   st.forEach((v, k) => stories.set(k, v)); ch.forEach((v, k) => chapters.set(k, v));
@@ -554,14 +558,14 @@ function renderStory(sid, opt = {}){
   $("#readBtn").onclick = $("#readBtn2").onclick = () => renderRead(sid);
   const ti = $("#storyTitle");
   let tT;
-  const saveTitle = () => { const v = ti.value.trim(); if(v === s.title) return; s.title = v; s.updatedAt = now(); saveStory(s).catch(() => toast("Chưa lưu được tên truyện.")); };
+  const saveTitle = () => { const v = nfc(ti.value).trim(); if(v === s.title) return; s.title = v; s.updatedAt = now(); saveStory(s).catch(() => toast("Chưa lưu được tên truyện.")); };
   ti.oninput = () => { clearTimeout(tT); tT = setTimeout(saveTitle, 600); };
-  ti.onblur = () => { clearTimeout(tT); saveTitle(); };
+  ti.onblur = () => { clearTimeout(tT); if(ti.value !== nfc(ti.value)) ti.value = nfc(ti.value); saveTitle(); };
   ti.onkeydown = e => { if(e.key === "Enter") ti.blur(); };
   const notes = $("#notes"); let nT;
-  const saveNotes = () => { if(notes.value === s.notes) return; s.notes = notes.value; saveStory(s).catch(() => toast("Chưa lưu được ghi chú.")); };
+  const saveNotes = () => { const v = nfc(notes.value); if(v === s.notes) return; s.notes = v; s.updatedAt = now(); saveStory(s).catch(() => toast("Chưa lưu được ghi chú.")); };
   notes.oninput = () => { clearTimeout(nT); nT = setTimeout(saveNotes, 700); };
-  notes.onblur = () => { clearTimeout(nT); saveNotes(); };
+  notes.onblur = () => { clearTimeout(nT); if(notes.value !== nfc(notes.value)) notes.value = nfc(notes.value); saveNotes(); };
   const leave = () => { saveTitle(); saveNotes(); };
   $$("[data-ch]").forEach(b => b.onclick = () => { leave(); openEditor(b.dataset.ch); });
   if($("#arrange")) $("#arrange").onclick = () => renderStory(sid, {arrange:!view.arrange, keepScroll:true});
@@ -631,7 +635,7 @@ function renderRead(sid){
       <div class="prose" data-body="${esc(c.id)}"></div>
       <button class="linkbtn" data-edit="${esc(c.id)}">Sửa chương này</button></section>`).join("")}
   </article>`;
-  main.style.setProperty("--fs", fontSize + "px");
+  main.style.setProperty("--fs", (fontSize / 16) + "rem");
   list.forEach(c => { const el = main.querySelector(`[data-body="${c.id}"]`); el.innerHTML = cleanHTML(c.body); decorateFigures(el, false); });
   $("#back").onclick = () => renderStory(sid);
   $("#lockBtn").onclick = lock;
@@ -742,7 +746,7 @@ function openEditor(cid, focusTitle){
     </div>
     <input id="imgIn" type="file" accept="image/*" multiple hidden>
   </div>`;
-  main.style.setProperty("--fs", fontSize + "px");
+  main.style.setProperty("--fs", (fontSize / 16) + "rem");
   const body = bodyEl(), title = $("#chTitle");
   title.value = c.title || "";
   body.innerHTML = cleanHTML(c.body) || "<p><br></p>";
@@ -753,8 +757,8 @@ function openEditor(cid, focusTitle){
   body.addEventListener("input", () => { ensureBlocks(); markDirty(); });
   title.addEventListener("input", markDirty);
   title.addEventListener("keydown", e => { if(e.key === "Enter"){ e.preventDefault(); placeCaret(body.firstElementChild, true); } });
-  body.addEventListener("blur", () => flush());
-  title.addEventListener("blur", () => flush());
+  body.addEventListener("blur", () => { fixMarks(body); flush(); });
+  title.addEventListener("blur", () => { if(title.value !== nfc(title.value)) title.value = nfc(title.value); flush(); });
   body.addEventListener("paste", onPaste);
   body.addEventListener("click", onBodyClick);
   body.addEventListener("keydown", e => {
@@ -767,7 +771,16 @@ function openEditor(cid, focusTitle){
   $("#back").onclick = async () => { await flush(); ed = null; cleanupImages(); renderStory(c.sid, {keepScroll:false}); if(syncCfg) syncNow(); };
 
   if(focusTitle){ title.focus(); title.select(); }
-  else { const last = body.lastElementChild; if(last && last.tagName !== "FIGURE") placeCaret(last, false); const sc = $("#edScroll"); sc.scrollTop = sc.scrollHeight; }
+  else {
+    const last = body.lastElementChild; if(last && last.tagName !== "FIGURE") placeCaret(last, false);
+    // show where you stopped; a short chapter keeps its title in view
+    const sc = $("#edScroll");
+    sc.scrollTop = 0;
+    if(last){
+      const end = last.getBoundingClientRect().bottom - sc.getBoundingClientRect().top;
+      if(end > sc.clientHeight * 0.7) sc.scrollTop = end - sc.clientHeight * 0.6;
+    }
+  }
 }
 
 document.addEventListener("selectionchange", () => {
@@ -776,6 +789,10 @@ document.addEventListener("selectionchange", () => {
   if(sel.rangeCount && body.contains(sel.anchorNode)){ savedRange = sel.getRangeAt(0).cloneRange(); updateToolbarState(); }
 });
 
+function fixMarks(root){
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  while(w.nextNode()){ const n = w.currentNode, v = nfc(n.nodeValue); if(v !== n.nodeValue) n.nodeValue = v; }
+}
 function placeCaret(el, atStart){
   if(!el) return;
   const body = bodyEl(); body.focus({preventScroll:true});
@@ -822,7 +839,7 @@ function markDirty(){
   ed.dirty = true; setStatus("saving", "Đang gõ…"); updateEmpty();
   clearTimeout(ed.t); ed.t = setTimeout(flush, 800);
 }
-function setFont(d){ fontSize = Math.max(14, Math.min(28, fontSize + d)); $("#main").style.setProperty("--fs", fontSize + "px"); ls.set("sotruyen.fs", fontSize); }
+function setFont(d){ fontSize = Math.max(14, Math.min(28, fontSize + d)); $("#main").style.setProperty("--fs", (fontSize / 16) + "rem"); ls.set("sotruyen.fs", fontSize); }
 function setStatus(s, txt){ const el = $("#status"); if(!el) return; el.dataset.s = s; $("#statusTxt").textContent = txt; }
 
 function toggleBlock(tag){
@@ -897,7 +914,7 @@ function trimEdge(el, start){
 function onPaste(e){
   if(e.target.closest && e.target.closest("figcaption")){
     e.preventDefault();
-    const t = (e.clipboardData.getData("text/plain") || "").replace(/\s+/g, " ");
+    const t = nfc(e.clipboardData.getData("text/plain") || "").replace(/\s+/g, " ");
     document.execCommand("insertText", false, t); markDirty(); return;
   }
   e.preventDefault();
@@ -908,7 +925,7 @@ function onPaste(e){
     decorateNew();
   } else if(text){
     const parts = text.replace(/\r/g, "").split(/\n+/);
-    parts.forEach((line, i) => { if(i) document.execCommand("insertParagraph"); if(line) document.execCommand("insertText", false, line); });
+    parts.forEach((line, i) => { if(i) document.execCommand("insertParagraph"); if(line) document.execCommand("insertText", false, nfc(line)); });
     ensureBlocks();
   }
   markDirty(); updateWC();
@@ -999,7 +1016,7 @@ async function flush(){
   const c = chapters.get(e.id), body = bodyEl(), title = $("#chTitle");
   if(!c || !body) return;
   const t = now();
-  const next = {...c, title:title.value.trim(), body:cleanHTML(body.innerHTML) || "<p><br></p>", updatedAt:t};
+  const next = {...c, title:nfc(title.value).trim(), body:cleanHTML(body.innerHTML) || "<p><br></p>", updatedAt:t};
   e.dirty = false;
   setStatus("saving", "Đang lưu…");
   try{
@@ -1033,6 +1050,11 @@ function renderSettings(){
       <div class="row"><button class="ghost" id="rfBtn" type="button">Chọn file sao lưu</button><input id="rf" type="file" accept=".json,application/json" hidden></div>
       <div id="restoreBox"></div>
     </section>
+    <section class="box">
+      <h2>Cỡ giao diện trên máy này</h2>
+      <p class="sub">Phóng to hoặc thu nhỏ toàn bộ chữ và nút. Mỗi máy chọn riêng. Cỡ chữ khi viết vẫn chỉnh bằng A− / A+ trong trình soạn.</p>
+      <div class="row seg" role="group" aria-label="Cỡ giao diện">${UI_SIZES.map(([n, v]) => `<button class="ghost${v === uiScale ? " on" : ""}" data-ui="${v}" aria-pressed="${v === uiScale}">${n}</button>`).join("")}</div>
+    </section>
     ${syncSettingsHTML()}
     <section class="box">
       <h2>Đổi mật khẩu</h2>
@@ -1062,6 +1084,11 @@ function renderSettings(){
   $("#rf").onchange = e => { const f = e.target.files[0]; e.target.value = ""; externalUntil = 0; if(f) startRestore(f); };
   $("#cp").addEventListener("submit", changePassword);
   bindSyncSettings();
+  $$("[data-ui]").forEach(b => b.onclick = () => {
+    uiScale = Number(b.dataset.ui); ls.set("sotruyen.ui", uiScale);
+    document.documentElement.style.setProperty("--ui", uiScale);
+    $$("[data-ui]").forEach(x => { const on = Number(x.dataset.ui) === uiScale; x.classList.toggle("on", on); x.setAttribute("aria-pressed", on); });
+  });
   checkOffline();
 }
 
@@ -1075,7 +1102,7 @@ async function checkOffline(){
   }catch(e){ if(st) st.textContent = ""; }
   if(!el) return;
   let ready = false;
-  try{ ready = !!(navigator.serviceWorker && navigator.serviceWorker.controller) && (await (await caches.open("sotruyen-v5")).keys()).length >= 7; }catch(e){}
+  try{ ready = !!(navigator.serviceWorker && navigator.serviceWorker.controller) && (await (await caches.open("sotruyen-v7")).keys()).length >= 7; }catch(e){}
   el.innerHTML = ready
     ? "<strong>Đã sẵn sàng chạy không cần mạng.</strong> Ứng dụng đã được lưu đầy đủ trên máy, mở được kể cả khi trang web bị gỡ xuống."
     : "Chưa sẵn sàng chạy không cần mạng. Hãy mở ứng dụng từ màn hình chính khi có mạng, đóng hẳn rồi mở lại một lần.";
@@ -1270,6 +1297,16 @@ async function conflictCopy(local, remote, keepRemote){
     body: loser.fmt === "html" ? loser.body : textToHTML(loser.body), order:(src.order || 0) + 0.5, createdAt:t, updatedAt:t});
 }
 
+// Story notes changed on both devices: keep the newer story and add the other notes below it.
+async function mergeNotes(local, remote, keepRemote){
+  let a, b;
+  try{ a = await unseal(local.enc); b = await unseal(remote.enc); }catch(e){ return null; }
+  const win = keepRemote ? b : a, lose = keepRemote ? a : b, base = keepRemote ? remote : local;
+  if((lose.notes || "").trim() === (win.notes || "").trim() || !(lose.notes || "").trim()) return null;
+  const notes = (win.notes || "").trim() ? win.notes.replace(/\s+$/, "") + "\n\n— Ghi chú từ máy kia —\n" + lose.notes : lose.notes;
+  return sealStory({id:base.id, title:win.title, notes, createdAt:base.createdAt, updatedAt:Math.max(local.updatedAt || 0, remote.updatedAt || 0) + 1});
+}
+
 async function pull(cfg){
   const head = await remoteHead(cfg);
   if(!head) return {head:null, treeSha:null, map:{}, changed:false, copies:0};
@@ -1291,15 +1328,15 @@ async function pull(cfg){
     }
     const remote = await readBlob(cfg, sha);
     if(!local){ remoteOps.push({store, op:"put", value:remote}); continue; }
-    const ru = remote.updatedAt || 0, lu = local.updatedAt || 0;
-    if(ru === lu) continue;
-    const localChanged = dirty.has(key), remoteNewer = ru > lu;
-    if(store === "chapters" && localChanged && !remote.deleted && !local.deleted){
-      const copy = await conflictCopy(local, remote, remoteNewer);
-      if(copy) localOps.push({store:"chapters", op:"put", value:copy});
+    // Not changed here since the last sync: the other device's version is the current one.
+    if(!dirty.has(key)){ remoteOps.push({store, op:"put", value:remote}); continue; }
+    // Changed on both devices: the newer one wins, nothing written is thrown away.
+    const remoteNewer = (remote.updatedAt || 0) > (local.updatedAt || 0);
+    if(!remote.deleted && !local.deleted){
+      const extra = store === "chapters" ? await conflictCopy(local, remote, remoteNewer) : await mergeNotes(local, remote, remoteNewer);
+      if(extra) localOps.push({store, op:"put", value:extra});
     }
     if(remoteNewer){ remoteOps.push({store, op:"put", value:remote}); dirty.delete(key); }
-    else if(!localChanged) dirty.set(key, 1);
   }
   // pictures the other device removed
   const used = new Set(); for(const c of chapters.values()) imageIds(c.body).forEach(i => used.add(i));
@@ -1403,7 +1440,7 @@ async function enableSync(cfg){
   for(const s of ["stories", "chapters", "images"]) for(const id of await DB.keys(s)) dirty.set(s + ":" + id, 1);
   syncState = {lastCommit:null, treeSha:null, synced:{}};
   sync.err = ""; sync.pwRemote = null;
-  await DB.write([await saveSyncCfg(cfg)].concat(dirtyOps(), stateOps()), {remote:true});
+  await DB.write([await saveSyncCfg(cfg), {store:"meta", op:"put", key:"syncFix", value:2}].concat(dirtyOps(), stateOps()), {remote:true});
   await syncNow();
   if(sync.err) throw userErr(sync.err);
 }
@@ -1418,6 +1455,11 @@ async function loadSync(){
     if(r) syncCfg = await unseal(r.enc);
     dirty = new Map(((await DB.get("meta", "dirty")) || []).map(k => [k, 1]));
     syncState = (await DB.get("meta", "syncState")) || {lastCommit:null, treeSha:null, synced:{}};
+    // one-time full check so notes and chapter order skipped by the earlier version arrive now
+    if(syncCfg && !(await DB.get("meta", "syncFix"))){
+      syncState = {lastCommit:null, treeSha:null, synced:{}};
+      await DB.write([{store:"meta", op:"put", key:"syncFix", value:2}].concat(stateOps()), {remote:true});
+    }
   }catch(e){ syncCfg = null; }
 }
 
@@ -1501,7 +1543,7 @@ function renderConnect(){
     if(!key) return fail("Sai mật khẩu của sổ.", "Mở sổ và tải truyện về");
     const v = {v:1, salt:rv.salt, iter:rv.iter, check:rv.check, createdAt:rv.createdAt || now()};
     syncState = {lastCommit:null, treeSha:null, synced:{}}; dirty = new Map();
-    await DB.write([{store:"meta", op:"put", key:"vault", value:v}, await saveSyncCfg(cfg, key)].concat(dirtyOps(), stateOps()), {remote:true});
+    await DB.write([{store:"meta", op:"put", key:"vault", value:v}, await saveSyncCfg(cfg, key), {store:"meta", op:"put", key:"syncFix", value:2}].concat(dirtyOps(), stateOps()), {remote:true});
     vault = v; KEY = key; $("#cPw").value = "";
     await afterUnlock();
   });
